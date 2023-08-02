@@ -1,0 +1,142 @@
+function [varargout] = DAS_ls(m_hat,data,varargin)
+% Discrete Augmented Space least squares
+%
+% Off-Resonance aware reconstruction. It augments the dimensions adding
+% time frequency to image space and time (or kf) to Fourier space. Then
+% calls lsqr with an efficiente implementation of the matrix
+% multiplication.
+%
+% DAS_ls(m_hat,data,varargin) solves m_hat = A*m
+%       m_hat:     acquired data (hat because it is in k_space)
+%       data:      information about the problem
+%                   .Nd: dimensions
+%                   .Nf: size of augmentation
+%                   .targetdf: sampling period in frequency
+%                   .targetdt: sampling period in time
+%                   .L:  Number of k-space samples
+%                   .FTst: structure with information for NUFFT (only used for non-uniform)
+%       varargin:  inputs that will be passed directly to lsqr
+%
+%       varargout: output (same as lsqr)
+
+%
+% Pablo Irarrázaval
+% 16 nov 2022: creation (based on AFDrecon_fft.m)
+% 28 noc 2022: Now it calculates the NUFFT only for needed f or t "planes"
+% 15 jan 2023: Merges Uniform and Non-uniform in one function
+
+global VERBOSE
+
+% Starts by getting number of dimensions and size
+Nd = data.Nd;
+DIM = length(Nd);
+if (~(DIM==2) && ~data.Uniform), error('Non-uniform only works in 2D.'); end
+if DIM == 1, Nd = [Nd 1]; end  % to use reshape command (it needs at least two components)
+Nf = data.Nf;
+if ~data.Uniform, L = data.L; end
+
+% Initializes pix,tix,linpix,lintix,idxpix and idxtix
+data = pixtix(data,'create +'); % Creates pix and tix in Natural Order
+data = pixtix(data,'shift f'); % Shift Order in the f/kf direction
+if data.Uniform
+    data = pixtix(data,'shift x'); % Shift Order in x/k for uniform sampling
+end
+data = pixtix(data,'linear'); % Creates linpix and lintix (linearized for efficiency)
+data = pixtix(data,'avail'); % Creates idxpix and idxtix (indices with data)
+
+% Fills in recon structure
+reconopts.Nd = Nd;
+reconopts.Nf = Nf;
+reconopts.Uniform = data.Uniform;
+% linpix and lintix are already fftshift'ed for Uniform
+reconopts.linpix = data.linpix;
+reconopts.idxpix = data.idxpix;
+reconopts.lintix = data.lintix;
+reconopts.idxtix = data.idxtix;
+reconopts.L = data.L;
+if data.Uniform
+    reconopts.rawdata_dim = Nd;
+else
+    reconopts.rawdata_dim = [L 1];
+    reconopts.FTst = data.FTst;
+end
+reconopts.w = data.w;
+
+
+% reconopts.tix = tix;
+% reconopts.pix = pix;
+% reconopts.dt = ndt;
+% reconopts.df = ndf;
+% reconopts.p = data.p;
+% reconopts.t = data.t;
+% 
+
+if VERBOSE
+    afuncalls = 0; % records number of callings to afun
+    if data.Uniform, funname = 'FFT'; else funname = 'NUFFT'; end
+    fprintf('DAS_ls: using %d frequencies (df = %f Hz) and %d times (dt = %f ms).\n',...
+        length(data.idxpix),data.df,length(data.idxtix),data.dt*1000);
+end
+
+% Erase, I am only testing
+epsil = zeros(128*128,128); % Only the first 128 columns
+for bori = 1:128
+    r = zeros(128*128,1); r(bori+128) = 1;
+    epsil(:,bori) = DE(r,reconopts);
+end
+
+
+if data.Uniform
+    rawdata_dim = Nd;
+    b = fftshift(m_hat); % more efficiente to work in FFT order in optimization
+    % %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % The optimization min ||Em - m_hat||_2
+    [varargout{1:nargout}] = lsqr(@afun,b(:),varargin{:});
+    % %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    varargout{1} = fftshift(reshape(varargout{1},Nd)); % Go back to Natural order
+else
+    rawdata_dim = [L 1];
+    b = m_hat(:).*data.w;
+    % %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % The optimization min ||Em - m_hat||_2
+    [varargout{1:nargout}] = mylsqr(@afun,b,varargin{:});
+    % %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    varargout{1} = reshape(varargout{1},Nd);
+end
+
+if VERBOSE, fprintf('\n'); end % end count of callings to afun
+
+%-------------------------------------
+    function y = afun(r,flag)
+        % Where the work is done. Implements a fast matrix multiplication by
+        % using dimension augmentation, ffts and sampling, as follows:
+        %
+        % Steps for the direct problem (notransp): s_hat(kx,ky) = FH * m(x,y)
+        %       D1) Augment m(x,y) to M(x,y,f) = m(x,y) \delta( f-p(x,y) )
+        %       D2) FT M(x,y,f) to obtain M_hat(kx,ky,kf)
+        %       D3) Sample M_hat to obtain m_hat(kx,ky) = M_hat(kx,ky, t(kx,ky) )
+        %
+        % Steps for the inverse problem (transp): mp(x,y) = FH' * s_hat(kx,ky)
+        %       I1) Augment m_hat(kx) to M_hat(kx,ky,kf) = m_hat(kx,ky) \delta( kf-t(kx,ky) )
+        %       I2) Inverse FT M_hat(kx,ky,kf) to obtain M(x,y,f)
+        %       I3) Sample M to obtain mp(x,y) = M( x,y p(x,y) )
+
+%         if VERBOSE 
+%             if afuncalls == 0, afuncalls = 1; fprintf('%s calls: %3d ',funname,afuncalls);
+%             else, afuncalls = afuncalls + 1; fprintf('\b\b\b\b%3d ',afuncalls); end
+%         end
+
+        if strcmp(flag,'notransp') % Compute A*r
+
+            y = DE(r,reconopts);
+
+        elseif strcmp(flag,'transp') % Compute A'*r
+
+            y = DEadj(r,reconopts);  
+
+        end
+
+    end
+
+
+end
